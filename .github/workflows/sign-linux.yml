@@ -1,0 +1,231 @@
+name: Sign Linux Binary or Installer
+
+on:
+  workflow_call:
+    inputs:
+      unsigned-artifact-name:
+        description: 'Name of the artifact containing the file to sign'
+        required: false
+        type: string
+        default: 'file-to-sign'
+      file-to-sign:
+        description: 'Path to the file that needs to be signed'
+        required: true
+        type: string
+      signed-artifact-name:
+        description: 'Name of the artifact containing the signed file'
+        required: false
+        type: string
+        default: 'file-signed'
+      detached-signature:
+        description: 'Produce a detached PEM signature (sidecar). When false, produces an enveloped CMS blob containing the original file plus the signature.'
+        required: false
+        type: boolean
+        default: true
+      runs-on:
+        description: 'Runner label(s). Defaults to GitHub-hosted ubuntu-latest; pass a self-hosted label to run on a private runner.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      SIGNING_CODE_SIGNING_CERT:
+        description: 'Code signing certificate content in PEM format'
+        required: true
+      SIGNING_GCP_KMS_KEY:
+        description: 'Name of the GCP KMS signing key to use'
+        required: true
+      SIGNING_GCP_KMS_KEYRING:
+        description: 'GCP KMS Keyring name'
+        required: true
+      SIGNING_GCP_KMS_LOCATION:
+        description: 'GCP KMS location'
+        required: true
+      SIGNING_GCP_PROJECT_ID:
+        description: 'GCP Project ID where KMS resources are located'
+        required: true
+      SIGNING_GCP_SERVICE_ACCOUNT:
+        description: 'GCP Service Account email for signing'
+        required: true
+      SIGNING_GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: 'GCP Workload Identity Provider for authentication'
+        required: true
+
+env:
+  DIGEST_ALG: sha384
+  ALLOWED_CALLER_REPOSITORIES: |
+    Dynatrace/dynatrace-otel-collector
+    dynatrace-infrastructure-test/test-repo-oss
+
+jobs:
+  sign-job:
+    name: Sign job
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CA_CERT: "dt-root.cert.pem"
+      UNSIGNED_ARTIFACT_NAME: "${{ inputs.unsigned-artifact-name }}"
+      SIGNED_ARTIFACT_NAME: "${{ inputs.signed-artifact-name }}"
+      INPUT_FILE: "${{ inputs.file-to-sign }}"
+      DETACHED: "${{ inputs.detached-signature }}"
+      OUTPUT_FILE: "${{ inputs.file-to-sign }}${{ inputs.detached-signature && '.sig' || '.signed' }}"
+
+    steps:
+      - name: Validate caller repository
+        shell: bash
+        env:
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          authorized=0
+          while IFS= read -r repo; do
+            repo="${repo//[[:space:]]/}"
+            [ -z "$repo" ] && continue
+            if [ "$repo" = "$CALLER_REPOSITORY" ]; then
+              authorized=1
+              break
+            fi
+          done <<< "$ALLOWED_CALLER_REPOSITORIES"
+
+          if [ "$authorized" -ne 1 ]; then
+            echo "::error::Repository '$CALLER_REPOSITORY' is not authorized to call this signing workflow."
+            echo "Authorized repositories:"
+            printf '%s\n' "$ALLOWED_CALLER_REPOSITORIES" | sed '/^[[:space:]]*$/d; s/^/  - /'
+            exit 1
+          fi
+          echo "Repository '$CALLER_REPOSITORY' is authorized to call this workflow."
+
+      - name: Download artifact to sign
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.SIGNING_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SIGNING_GCP_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget openssl libengine-pkcs11-openssl
+
+      - name: Download Google Cloud KMS PKCS#11 library
+        shell: bash
+        env:
+          # renovate: datasource=github-releases depName=GoogleCloudPlatform/kms-integrations extractVersion=^pkcs11-v(?<version>.+)$
+          LIBKMSP11_VERSION: "1.9"
+          LIBKMSP11_SHA256: "5397f965073cd5d1e2c43e5148f102f31a7c835902f97eb41c7c9c0f1b876a40"
+        run: |
+          set -euo pipefail
+          PROVIDER="libkmsp11-${LIBKMSP11_VERSION}-linux-amd64.tar.gz"
+
+          wget -q "https://github.com/GoogleCloudPlatform/kms-integrations/releases/download/pkcs11-v${LIBKMSP11_VERSION}/${PROVIDER}"
+          echo "${LIBKMSP11_SHA256}  ${PROVIDER}" | sha256sum --check
+
+          tar -xzf "$PROVIDER"
+          sudo mv "libkmsp11-${LIBKMSP11_VERSION}-linux-amd64/libkmsp11.so" /usr/local/lib/
+          sudo chmod 755 /usr/local/lib/libkmsp11.so
+          rm -rf "$PROVIDER" "libkmsp11-${LIBKMSP11_VERSION}-linux-amd64"
+
+      - name: Configure PKCS#11 Library
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tee /etc/pkcs11-kms.yml > /dev/null << EOF
+          tokens:
+            - key_ring: "projects/${{ secrets.SIGNING_GCP_PROJECT_ID }}/locations/${{ secrets.SIGNING_GCP_KMS_LOCATION }}/keyRings/${{ secrets.SIGNING_GCP_KMS_KEYRING }}"
+          EOF
+          echo "KMS_PKCS11_CONFIG=/etc/pkcs11-kms.yml" >> "$GITHUB_ENV"
+          echo "PKCS11_MODULE_PATH=/usr/local/lib/libkmsp11.so" >> "$GITHUB_ENV"
+
+      - name: Fetch CA certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q https://ca.dynatrace.com/dt-root.cert.pem -O "$CA_CERT"
+          echo "Downloaded CA certificate"
+
+      - name: Sign file
+        shell: bash
+        env:
+          CERT_CONTENT: ${{ secrets.SIGNING_CODE_SIGNING_CERT }}
+          KEY_NAME: "${{ secrets.SIGNING_GCP_KMS_KEY }}"
+        run: |
+          set -euo pipefail
+
+          CERT_FILE=$(mktemp /tmp/signing-cert.XXXXXX.pem)
+          trap 'rm -f "$CERT_FILE"' EXIT
+          printf "%s\n" "$CERT_CONTENT" > "$CERT_FILE"
+
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "::error file=$INPUT_FILE::Input file not found"
+            exit 1
+          fi
+
+          if [ ! -s "$CERT_FILE" ]; then
+            echo "::error file=$CERT_FILE::Failed to write certificate content"
+            exit 1
+          fi
+
+          if [ ! -f "$CA_CERT" ]; then
+            echo "::error file=$CA_CERT::CA certificate file not found"
+            exit 1
+          fi
+
+          EXTRA_FLAGS=()
+          if [ "$DETACHED" == "true" ]; then
+            echo "::notice::Creating detached signature"
+            EXTRA_FLAGS+=(-binary -outform PEM)
+          fi
+
+          echo "Signing file: $INPUT_FILE"
+          echo "Key name: $KEY_NAME"
+          echo "Digest algorithm: $DIGEST_ALG"
+
+          openssl cms -sign \
+            -signer "$CERT_FILE" \
+            -nosmimecap \
+            -certfile "$CA_CERT" \
+            -md "$DIGEST_ALG" \
+            -engine pkcs11 \
+            -keyform engine \
+            -inkey "pkcs11:object=$KEY_NAME" \
+            -in "$INPUT_FILE" \
+            -out "$OUTPUT_FILE" \
+            "${EXTRA_FLAGS[@]}"
+
+          echo "Successfully signed: $INPUT_FILE -> $OUTPUT_FILE"
+
+      - name: Verify signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$DETACHED" == "true" ]; then
+            echo "Verifying detached signature..."
+            openssl cms -verify \
+              -CAfile "$CA_CERT" \
+              -in "$OUTPUT_FILE" \
+              -binary \
+              -inform PEM \
+              -content "$INPUT_FILE" > /dev/null
+          else
+            echo "Verifying enveloped S/MIME signature..."
+            openssl cms -verify \
+              -CAfile "$CA_CERT" \
+              -in "$OUTPUT_FILE" > /dev/null
+          fi
+          echo "Signature verified successfully"
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.SIGNED_ARTIFACT_NAME }}
+          path: ${{ env.OUTPUT_FILE }}
+          if-no-files-found: error
