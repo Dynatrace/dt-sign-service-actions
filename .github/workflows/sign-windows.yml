@@ -1,0 +1,345 @@
+name: Sign Windows Binary
+
+on:
+  workflow_call:
+    inputs:
+      unsigned-artifact-name:
+        description: 'Name of the artifact containing the file to sign'
+        required: false
+        type: string
+        default: 'file-to-sign'
+      file-to-sign:
+        description: 'Path to the file that needs to be signed'
+        required: true
+        type: string
+      signed-artifact-name:
+        description: 'Name of the artifact containing the signed file'
+        required: false
+        type: string
+        default: 'file-signed'
+      digest-alg:
+        description: 'Digest algorithm for signing and timestamping'
+        required: false
+        type: string
+        default: 'sha384'
+      page-hashes:
+        description: 'Whether to include page hashes (/ph flag)'
+        required: false
+        type: boolean
+        default: false
+      append-signature:
+         description: 'Whether to append the signature (dual signing)'
+         required: false
+         type: boolean
+         default: false
+      skip-verify:
+        description: 'Skip post-sign verification (e.g. for CAB files, which cannot carry page hashes)'
+        required: false
+        type: boolean
+        default: false
+      runs-on:
+        description: 'Runner label(s). Defaults to GitHub-hosted windows-latest; pass a self-hosted label to run on a private runner.'
+        required: false
+        type: string
+        default: 'windows-latest'
+    secrets:
+      SIGNING_CODE_SIGNING_CERT:
+        description: 'Code signing certificate content in PEM format'
+        required: true
+      SIGNING_GCP_KMS_KEY:
+        description: 'Name of the GCP KMS signing key to use'
+        required: true
+      SIGNING_GCP_KMS_KEYRING:
+        description: 'GCP KMS Keyring name'
+        required: true
+      SIGNING_GCP_KMS_LOCATION:
+        description: 'GCP KMS location'
+        required: true
+      SIGNING_GCP_PROJECT_ID:
+        description: 'GCP Project ID where KMS resources are located'
+        required: true
+      SIGNING_GCP_SERVICE_ACCOUNT:
+        description: 'GCP Service Account email for signing'
+        required: true
+      SIGNING_GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: 'GCP Workload Identity Provider for authentication'
+        required: true
+
+env:
+  KEY_VERSION: '1'
+  TIMESTAMP_URL: http://timestamp.digicert.com
+  ALLOWED_CALLER_REPOSITORIES: |
+    Dynatrace/dynatrace-otel-collector
+    dynatrace-infrastructure-test/test-repo-oss
+
+jobs:
+  sign-job:
+    name: Sign job
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      UNSIGNED_ARTIFACT_NAME: ${{ inputs.unsigned-artifact-name }}
+      SIGNED_ARTIFACT_NAME: ${{ inputs.signed-artifact-name }}
+      INPUT_FILE: ${{ inputs.file-to-sign }}
+      APPEND_SIGNATURE: ${{ inputs.append-signature }}
+
+    steps:
+      - name: Validate caller repository
+        shell: pwsh
+        env:
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $caller = $env:CALLER_REPOSITORY
+          $allowed = $env:ALLOWED_CALLER_REPOSITORIES -split "`n" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne "" }
+
+          if ($allowed -notcontains $caller) {
+            Write-Host "::error ::Repository '$caller' is not authorized to call this signing workflow."
+            Write-Host "Authorized repositories:"
+            $allowed | ForEach-Object { Write-Host "  - $_" }
+            exit 1
+          }
+          Write-Host "Repository '$caller' is authorized to call this workflow."
+
+      - name: Download artifact to sign
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.SIGNING_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SIGNING_GCP_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Download Google Cloud KMS CNG Provider
+        shell: pwsh
+        env:
+          # renovate: datasource=github-releases depName=GoogleCloudPlatform/kms-integrations extractVersion=^cng-v(?<version>.+)$
+          KMSCNG_VERSION: "1.3"
+          KMSCNG_SHA256: "4cb9fbf6f17f58ca1b404bf532c2d75519f5b3378f646b9c3ac4361e640f2450"
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:KMSCNG_VERSION
+          $expectedHash = $env:KMSCNG_SHA256
+          $url = "https://github.com/GoogleCloudPlatform/kms-integrations/releases/download/cng-v${version}/kmscng-${version}-windows-amd64.zip"
+          $provider = "kmscng.zip"
+
+          Write-Host "Downloading Google Cloud KMS CNG Provider v${version}..."
+          Invoke-WebRequest -Uri $url -OutFile $provider
+
+          $hash = Get-FileHash -Path $provider -Algorithm SHA256
+          if ($hash.Hash -ne $expectedHash) {
+             Write-Host "::error ::Checksum verification failed! Expected $expectedHash but got $($hash.Hash)"
+             exit 1
+          }
+
+          Expand-Archive -Path $provider -DestinationPath "." -Force
+          Remove-Item $provider
+
+      - name: Install CNG Provider
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $msiPath = Get-ChildItem -Recurse -Filter "kmscng.msi" | Select-Object -First 1
+
+          if ($null -eq $msiPath) {
+            Write-Host "::error ::kmscng.msi not found!"
+            exit 1
+          }
+
+          $installArgs = @(
+            "/i"
+            "`"$($msiPath.FullName)`""
+            "/quiet"
+            "/norestart"
+            "/l*v"
+            "kmscng-install.log"
+          )
+
+          $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            Write-Host "::error ::CNG Provider installation failed with exit code: $($process.ExitCode)"
+            exit 1
+          }
+
+          Write-Host "CNG Provider installed successfully"
+
+      - name: Locate signtool.exe from Windows SDK
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Locating signtool.exe from installed Windows SDK..."
+          $windowsKitsFolder = "C:\Program Files (x86)\Windows Kits\10\bin"
+
+          if (-not (Test-Path $windowsKitsFolder)) {
+            Write-Host "::error ::Windows Kits folder not found: $windowsKitsFolder"
+            exit 1
+          }
+
+          $folders = Get-ChildItem -Path $windowsKitsFolder -Directory
+          $signtoolPath = ""
+          $maxVersion = 0
+
+          foreach ($folder in $folders) {
+            if (-not $folder.Name.EndsWith(".0")) {
+              continue
+            }
+
+            $folderVersionStr = $folder.Name -replace '\.'
+            try {
+              $folderVersion = [int]$folderVersionStr
+            } catch {
+              continue
+            }
+
+            if ($folderVersion -gt $maxVersion) {
+              $signtoolFile = Join-Path $folder.FullName "x64\signtool.exe"
+
+              if (Test-Path $signtoolFile) {
+                $signtoolPath = $signtoolFile
+                $maxVersion = $folderVersion
+              } else {
+                Write-Host "::debug ::Skipping $signtoolFile (not found)"
+              }
+            }
+          }
+
+          if ($signtoolPath -eq "") {
+            Write-Host "::error ::Unable to find signtool.exe in $windowsKitsFolder"
+            exit 1
+          }
+
+          Write-Host "Found signtool.exe: $signtoolPath"
+
+          $signtoolDir = Split-Path -Parent $signtoolPath
+          echo "$signtoolDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Sign file
+        shell: pwsh
+        env:
+          CERT_CONTENT: ${{ secrets.SIGNING_CODE_SIGNING_CERT }}
+          GCP_KEYRING: ${{ secrets.SIGNING_GCP_KMS_KEYRING }}
+          GCP_LOCATION: ${{ secrets.SIGNING_GCP_KMS_LOCATION }}
+          GCP_PROJECT: ${{ secrets.SIGNING_GCP_PROJECT_ID }}
+          KEY_NAME: ${{ secrets.SIGNING_GCP_KMS_KEY }}
+          DIGEST_ALG: ${{ inputs.digest-alg }}
+          PAGE_HASHES: ${{ inputs.page-hashes }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $inputFile = $env:INPUT_FILE
+          $certContent = $env:CERT_CONTENT
+          $keyName = $env:KEY_NAME
+          $digestAlg = $env:DIGEST_ALG
+          $pageHashes = $env:PAGE_HASHES -eq 'true'
+
+          if ([string]::IsNullOrEmpty($certContent)) {
+              Write-Host "::error ::Certificate secret (SIGNING_CODE_SIGNING_CERT) is empty."
+              exit 1
+          }
+          if ([string]::IsNullOrEmpty($keyName)) {
+              Write-Host "::error ::KMS key secret (SIGNING_GCP_KMS_KEY) is empty."
+              exit 1
+          }
+
+          $certFile = [System.IO.Path]::GetTempFileName()
+          $certFile = [System.IO.Path]::ChangeExtension($certFile, ".pem")
+          [System.IO.File]::WriteAllText($certFile, $certContent)
+
+          try {
+            if (-not (Test-Path $inputFile)) {
+                Write-Host "::error file=$inputFile::Input file not found"
+                exit 1
+            }
+
+            if (-not (Test-Path $certFile)) {
+                Write-Host "::error file=$certFile::Failed to create certificate file"
+                exit 1
+            }
+
+            Write-Host "Signing file: $inputFile"
+            Write-Host "Using key: $keyName (version $env:KEY_VERSION)"
+
+            $keyPath = "projects/$env:GCP_PROJECT/locations/$env:GCP_LOCATION/keyRings/$env:GCP_KEYRING/cryptoKeys/$keyName/cryptoKeyVersions/$env:KEY_VERSION"
+
+            $signtoolArgs = @(
+              "sign",
+              "/v",
+              "/csp", "Google Cloud KMS Provider",
+              "/kc", "$keyPath",
+              "/f", "$certFile",
+              "/fd", "$digestAlg",
+              "/tr", "$env:TIMESTAMP_URL",
+              "/td", "$digestAlg"
+            )
+
+            if ($pageHashes) {
+               $signtoolArgs += "/ph"
+            }
+            if ($env:APPEND_SIGNATURE -eq 'true') {
+               Write-Host "Appending signature..."
+               $signtoolArgs += "/as"
+            }
+
+            $signtoolArgs += "$inputFile"
+
+            & signtool.exe @signtoolArgs
+
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "::error file=$inputFile::Signing failed with exit code: $LASTEXITCODE"
+                exit 1
+            }
+            Write-Host "Successfully signed: $inputFile"
+          }
+          finally {
+            if (Test-Path $certFile) {
+              Remove-Item -Path $certFile -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Verify signature
+        if: ${{ inputs.skip-verify != true }}
+        shell: pwsh
+        env:
+          PAGE_HASHES: ${{ inputs.page-hashes }}
+        run: |
+          Write-Host "Verifying signature..."
+
+          $verifyArgs = @("verify", "/pa")
+          if ($env:PAGE_HASHES -eq 'true') {
+            $verifyArgs += "/v"
+            $verifyArgs += "/ph"
+          }
+          $verifyArgs += $env:INPUT_FILE
+
+          & signtool.exe @verifyArgs
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error file=$env:INPUT_FILE::Signature verification failed with exit code: $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "Signature verified successfully"
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.SIGNED_ARTIFACT_NAME }}
+          path: ${{ env.INPUT_FILE }}
+          if-no-files-found: error
