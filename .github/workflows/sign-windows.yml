@@ -71,6 +71,7 @@ env:
   ALLOWED_CALLER_REPOSITORIES: |
     Dynatrace/dynatrace-otel-collector
     dynatrace-infrastructure-test/test-repo-oss
+    dynatrace-oss/dtctl
 
 jobs:
   sign-job:
