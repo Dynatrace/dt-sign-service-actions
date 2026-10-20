@@ -72,6 +72,7 @@ env:
     Dynatrace/dynatrace-otel-collector
     dynatrace-infrastructure-test/test-repo-oss
     dynatrace-oss/dtctl
+    dynatrace-oss/dtwiz
 
 jobs:
   sign-job:
